@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+
+# IDF component manager
+managed_components/
+dependencies.lock
+
+# SDK config (keep sdkconfig, ignore CI variants)
+sdkconfig.ci.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Certificates (regenerated)
+certs/
