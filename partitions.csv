@@ -1,0 +1,6 @@
+nvs,data,nvs,0x9000,24K
+otadata,data,ota,0xb000,8K
+phy_init,data,phy,0xc000,4K
+app0,app,ota_0,0x10000,1500K
+app1,app,ota_1,0x10000,1500K
+cert,data,cert,0x1F0000,16K
