@@ -379,12 +379,21 @@ static void hid_task(void *arg)
                 uint8_t report[KEYBOARD_REPORT_LEN];
                 report[0] = modifier;
                 report[1] = 0;
-                for (uint8_t i = 0; i < 6; i++) report[2 + i] = barrier_key_to_hid(act->pressed_keys[i]);
+                for (uint8_t i = 0; i < 6; i++) {
+                    uint16_t k = act->pressed_keys[i];
+                    uint8_t hid = k ? barrier_key_to_hid(k) : 0;
+                    // Merge modifier keys (0xE0-0xE7) into report[0] instead of key slots
+                    if (hid >= 0xE0 && hid <= 0xE7) {
+                        report[0] |= (uint8_t)(1u << (hid - 0xE0));
+                        hid = 0;
+                    }
+                    report[2 + i] = hid;
+                }
                 send_kb_report(act, report);
                 break;
             }
 
-            case ACT_CMD_KEY_UP:
+            case ACT_CMD_KEY_UP: {
                 uint16_t key = cmd.d.k.key;
                 uint16_t mask = cmd.d.k.mask;
                 (void)cmd.d.k.button;
@@ -408,9 +417,18 @@ static void hid_task(void *arg)
                 uint8_t report[KEYBOARD_REPORT_LEN];
                 report[0] = modifier;
                 report[1] = 0;
-                for (uint8_t i = 0; i < 6; i++) report[2 + i] = barrier_key_to_hid(act->pressed_keys[i]);
+                for (uint8_t i = 0; i < 6; i++) {
+                    uint16_t k = act->pressed_keys[i];
+                    uint8_t hid = k ? barrier_key_to_hid(k) : 0;
+                    if (hid >= 0xE0 && hid <= 0xE7) {
+                        report[0] |= (uint8_t)(1u << (hid - 0xE0));
+                        hid = 0;
+                    }
+                    report[2 + i] = hid;
+                }
                 send_kb_report(act, report);
                 break;
+            }
 
             case ACT_CMD_KEY_REPEAT:
                 /* Host OS handles native key repeat */
