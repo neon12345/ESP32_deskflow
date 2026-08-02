@@ -13,6 +13,11 @@
 
 #include "eth_network.h"
 #include "network_events.h"
+#include "config/config.h"
+#include "soc/emac_reg.h"
+#include "lwip/netif.h"
+#include "lwip/prot/ethernet.h"
+#include "lwip/pbuf.h"
 
 static const char *TAG = "eth_network";
 
@@ -297,5 +302,85 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     }
     if (s_event_group != NULL) {
         xEventGroupSetBits(s_event_group, EVENT_ETH_HAS_IP);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Hardware VLAN configure (hot, no restart)                          */
+/* ------------------------------------------------------------------ */
+
+void eth_set_vlan(int16_t vlan_id)
+{
+    if (vlan_id == -1) {
+        REG_WRITE(EMAC_VLANTAG_REG, 0);
+        REG_WRITE(EMAC_VLANTAGINCLUSIONORREPLACEMENT_REG, 0);
+        ESP_LOGI(TAG, "VLAN hardware disabled");
+        return;
+    }
+
+    if ((vlan_id < 1) || (vlan_id > 4094)) {
+        ESP_LOGE(TAG, "Invalid VLAN ID %d, ignoring (must be 1-4094)", vlan_id);
+        return;
+    }
+
+    /* RX: EMAC hardware filters for matching VLAN VID (12-bit perfect match) */
+    REG_WRITE(EMAC_VLANTAG_REG,
+              (uint32_t)(vlan_id & 0x0FFF) |
+              EMAC_ETV
+             );
+
+    /* TX: EMAC hardware inserts VLAN tag on all outgoing frames */
+    REG_WRITE(EMAC_VLANTAGINCLUSIONORREPLACEMENT_REG,
+              (uint32_t)(vlan_id & 0x0FFF) |
+              (2 << 16) |   /* EMAC_VLC = 2 -> insert */
+              (1 << 18)     /* EMAC_VLP = 1 -> use register */
+             );
+
+    ESP_LOGI(TAG, "VLAN %d configured in EMAC hardware", vlan_id);
+}
+
+/* ------------------------------------------------------------------ */
+/* One-shot Ethernet reconfig task                                    */
+/* ------------------------------------------------------------------ */
+
+static void eth_reconfig_task(void *arg)
+{
+    EventGroupHandle_t eg = (EventGroupHandle_t)arg;
+
+    const deskflow_config_t *cfg = config_get_current();
+    if (cfg) {
+        eth_set_vlan(cfg->vlan_id);
+    }
+
+    /* Restart DHCP so we get a new IP on the new VLAN segment */
+    if (s_eth_state && s_eth_state->eth_netif) {
+        esp_netif_dhcpc_stop(s_eth_state->eth_netif);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_netif_dhcpc_start(s_eth_state->eth_netif);
+        ESP_LOGI(TAG, "DHCP client restarted");
+    }
+
+    /* Wait for DHCP to obtain IP before signaling reconnect */
+    EventBits_t bits = xEventGroupWaitBits(eg, EVENT_ETH_HAS_IP,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+    if (bits & EVENT_ETH_HAS_IP) {
+        ESP_LOGI(TAG, "DHCP renewed, got IP");
+    } else {
+        ESP_LOGW(TAG, "DHCP renew timed out, reconnecting anyway");
+    }
+
+    if (eg) {
+        xEventGroupSetBits(eg, EVENT_RECONNECT);
+    }
+
+    ESP_LOGI(TAG, "Ethernet reconfig done, signaled EVENT_RECONNECT");
+    vTaskDelete(NULL);
+}
+
+void eth_reconfig_one_shot(EventGroupHandle_t event_group)
+{
+    if (xTaskCreate(eth_reconfig_task, "eth_recfg", 4096,
+                    event_group, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create reconfig task");
     }
 }

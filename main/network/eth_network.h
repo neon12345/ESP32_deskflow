@@ -25,4 +25,10 @@ esp_err_t eth_init(eth_state_t *state, EventGroupHandle_t event_group);
 esp_err_t eth_start(eth_state_t *state);
 void      eth_stop(eth_state_t *state);
 
+/** Spawn a one-shot task that restarts Ethernet and chains EVENT_RECONNECT when done. */
+void      eth_reconfig_one_shot(EventGroupHandle_t event_group);
+
+/** Apply VLAN hardware filter/insert immediately (hot, no restart). */
+void      eth_set_vlan(int16_t vlan_id);
+
 #endif

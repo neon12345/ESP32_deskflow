@@ -13,6 +13,7 @@
 #include "driver/uart.h"
 #include "config/config.h"
 #include "grove/grove_uart.h"
+#include "eth_network.h"
 #include "network/network_events.h"
 #include "barrier/barrier_client.h"
 #include "web_server.h"
@@ -80,6 +81,8 @@ static const char SETTINGS_PAGE[] =
 "<option value='0'>US</option>"
 "<option value='1'>German (DE)</option>"
 "</select>"
+"<label>VLAN ID (-1 = disabled)</label>"
+"<input id='vlan_id' type='number' name='vlan_id' min='-1' max='4094'>"
 "<button type='submit'>Save</button>"
 "<button type='button' class='danger' onclick='reboot()'>Reboot</button>"
 "</form>"
@@ -94,6 +97,7 @@ static const char SETTINGS_PAGE[] =
 "document.getElementById('jiggle').value=d.jiggle_interval||30;"
 "document.getElementById('keep_awake').checked=!!d.keep_awake;"
 "document.getElementById('keyboard_layout').value=d.keyboard_layout||0;"
+"document.getElementById('vlan_id').value=d.vlan_id ?? -1;"
 "});"
 "load();"
 "document.getElementById('f').onsubmit=async e=>{"
@@ -102,6 +106,7 @@ static const char SETTINGS_PAGE[] =
 "if(d.keep_awake===undefined) d.keep_awake=0; else d.keep_awake=1;"
 "d.port=+d.port;d.screen_width=+d.screen_width;d.screen_height=+d.screen_height;"
 "d.scaling=+d.scaling;d.jiggle_interval=+d.jiggle_interval;d.keyboard_layout=+d.keyboard_layout;"
+"d.vlan_id=+d.vlan_id;"
 "fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
 "body:JSON.stringify(d)});load();"
 "};"
@@ -163,10 +168,12 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         "\"scaling\":%u,"
         "\"jiggle_interval\":%u,"
         "\"keep_awake\":%d,"
-        "\"keyboard_layout\":%d}",
+        "\"keyboard_layout\":%d,"
+        "\"vlan_id\":%d}",
                 cfg->server, cfg->port, cfg->device_name,
                 cfg->screen_width, cfg->screen_height, cfg->scaling,
-                cfg->jiggle_interval, cfg->keep_awake, cfg->keyboard_layout);
+                cfg->jiggle_interval, cfg->keep_awake, cfg->keyboard_layout,
+                cfg->vlan_id);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, n);
@@ -193,7 +200,8 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    deskflow_config_t cfg = *config_get_current();
+    deskflow_config_t old_cfg = *config_get_current();
+    deskflow_config_t cfg = old_cfg;
 
     const char *s;
 
@@ -244,15 +252,30 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     s = strstr(buf, "\"keyboard_layout\":");
     if (s) cfg.keyboard_layout = (uint8_t)strtoul(s + sizeof("\"keyboard_layout\":") - 1, NULL, 10);
 
+    s = strstr(buf, "\"vlan_id\":");
+    if (s) {
+        int16_t vid = (int16_t)strtol(s + sizeof("\"vlan_id\":") - 1, NULL, 10);
+        cfg.vlan_id = (vid == -1 || (vid >= 1 && vid <= 4094)) ? vid : cfg.vlan_id; /* reject invalid */
+    }
+
     if (config_save(&cfg) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Config saved to USB via web");
 
-    /* Signal barrier client to reconnect with new config */
-    if (s_event_group != NULL) {
-        xEventGroupSetBits(s_event_group, EVENT_RECONNECT);
+    /* Detect if VLAN changed and trigger Ethernet reconfig */
+    bool vlan_changed = (old_cfg.vlan_id != cfg.vlan_id);
+
+    if (vlan_changed) {
+        // Ethernet must restart first; one-shot task chains EVENT_RECONNECT when done
+        eth_reconfig_one_shot(s_event_group);
+        ESP_LOGI(TAG, "VLAN changed, spawning eth_reconfig_one_shot");
+    } else {
+        // Normal config change, just reconnect barrier
+        if (s_event_group != NULL) {
+            xEventGroupSetBits(s_event_group, EVENT_RECONNECT);
+        }
     }
     /* Wake barrier client from blocking calls */
     TaskHandle_t task = barrier_client_get_task_handle();

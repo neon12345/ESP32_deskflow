@@ -15,6 +15,7 @@ typedef struct deskflow_config {
     uint16_t screen_height;    // Virtual screen height (physical pixels)
     uint16_t scaling;          // Display scaling percentage (100=none, 125, 150, 200)
     uint8_t  keyboard_layout;  // Keyboard layout (0=US, 1=DE)
+    int16_t  vlan_id;          // VLAN ID: -1 = disabled, 1-4094 = VLAN ID
 } deskflow_config_t;
 
 esp_err_t config_load(void);
@@ -24,6 +25,9 @@ esp_err_t config_save(deskflow_config_t *cfg);
 
 /** Get pointer to the currently active config (set by app_main) */
 deskflow_config_t *config_get_current(void);
+
+/** Apply network settings (VLAN).  Currently a dummy placeholder. */
+void config_apply_network(void);
 
 /** Load certificates from USB into RAM. Call once at boot. */
 esp_err_t config_load_certs(void);

@@ -17,6 +17,7 @@ static const char *TAG = "config";
 #define DEFAULT_SCREEN_HEIGHT 1080
 #define DEFAULT_SCALING       100
 #define DEFAULT_KEYBOARD_LAYOUT 0  // 0=US, 1=DE
+#define DEFAULT_VLAN_ID         -1  // -1 = disabled
 #define USB_SETTINGS_PATH     "/usb0/settings.json"
 #define USB_CA_PATH           "/usb0/server_public_cert.pem"
 #define USB_CLIENT_CERT_PATH  "/usb0/client_public_cert.pem"
@@ -48,6 +49,7 @@ static void config_load_defaults(void)
     s_config.screen_height = DEFAULT_SCREEN_HEIGHT;
     s_config.scaling = DEFAULT_SCALING;
     s_config.keyboard_layout = DEFAULT_KEYBOARD_LAYOUT;
+    s_config.vlan_id = DEFAULT_VLAN_ID;
 }
 
 /* ------------------------------------------------------------------ */
@@ -77,12 +79,14 @@ esp_err_t config_save(deskflow_config_t *cfg)
         " \"scaling\": %u,\n"
         " \"jiggle_interval\": %u,\n"
         " \"keep_awake\": %s,\n"
-        " \"keyboard_layout\": %u}",
+        " \"keyboard_layout\": %u,\n"
+        " \"vlan_id\": %d}",
         cfg->server, cfg->port, cfg->device_name,
         cfg->screen_width, cfg->screen_height,
         cfg->scaling,
         cfg->jiggle_interval, cfg->keep_awake ? "true" : "false",
-        cfg->keyboard_layout);
+        cfg->keyboard_layout,
+        cfg->vlan_id);
 
     fflush(f);
     fsync(fileno(f));   /* flush FatFS cache to USB device */
@@ -119,7 +123,7 @@ esp_err_t config_load(void)
     char server[64] = {0};
     char device_name[32] = {0};
     char keep_str[8] = {0};
-    int port, sw, sh, sc, ji, kl;
+    int port, sw, sh, sc, ji, kl, vid;
 
     if (fscanf(f,
         "{ \"server\": \"%63[^\"]\",\n"
@@ -130,8 +134,9 @@ esp_err_t config_load(void)
         " \"scaling\": %d,\n"
         " \"jiggle_interval\": %d,\n"
         " \"keep_awake\": %7[^,\n],\n"
-        " \"keyboard_layout\": %d",
-        server, &port, device_name, &sw, &sh, &sc, &ji, keep_str, &kl) == 9) {
+        " \"keyboard_layout\": %d,\n"
+        " \"vlan_id\": %d}",
+        server, &port, device_name, &sw, &sh, &sc, &ji, keep_str, &kl, &vid) == 10) {
 
         strncpy(s_config.server, server, sizeof(s_config.server) - 1);
         s_config.port = (uint16_t)port;
@@ -142,6 +147,7 @@ esp_err_t config_load(void)
         s_config.jiggle_interval = (uint16_t)ji;
         s_config.keep_awake = (strcmp(keep_str, "true") == 0);
         s_config.keyboard_layout = (uint8_t)kl;
+        s_config.vlan_id = (int16_t)vid;
         ESP_LOGI(TAG, "Config loaded from %s", USB_SETTINGS_PATH);
     } else {
         ESP_LOGW(TAG, "Failed to parse %s, using defaults", USB_SETTINGS_PATH);
@@ -159,6 +165,18 @@ esp_err_t config_load(void)
 deskflow_config_t *config_get_current(void)
 {
     return &s_config;
+}
+
+/* ------------------------------------------------------------------ */
+/* Apply network settings (dummy placeholder for Phase 2)              */
+/* ------------------------------------------------------------------ */
+void config_apply_network(void)
+{
+    if (s_config.vlan_id != -1) {
+        ESP_LOGI(TAG, "VLAN %d configured (not yet applied -- dummy)", s_config.vlan_id);
+    } else {
+        ESP_LOGI(TAG, "VLAN disabled (dummy)");
+    }
 }
 
 /* ------------------------------------------------------------------ */
