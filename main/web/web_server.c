@@ -18,8 +18,138 @@
 #include "barrier/barrier_client.h"
 #include "web_server.h"
 #include "uart_page.h"
+#include "log_page.h"
+#include "settings_page.h"
 
 static const char *TAG = "web_server";
+
+/* ------------------------------------------------------------------
+ * Log WebSocket — ring buffer + live stream
+ * ------------------------------------------------------------------ */
+
+#define LOG_RING_BUF_SIZE   (2 * 1024)
+
+typedef struct {
+    httpd_handle_t hd;
+    int            fd;
+    uint8_t       *data;
+    size_t         len;
+} async_ws_send_arg_t;
+
+typedef struct {
+    httpd_handle_t  server;
+    int             fd;
+    volatile bool   connected;
+} log_ws_ctx_t;
+
+static log_ws_ctx_t g_log_ws_ctx = {0};
+
+bool web_log_ws_connected(void) { return g_log_ws_ctx.connected; }
+
+static uint8_t s_log_ring[LOG_RING_BUF_SIZE];
+static volatile size_t s_log_ring_head = 0;
+static volatile size_t s_log_ring_tail = 0;
+
+/** Async send callback for log WebSocket frames. */
+static void log_ws_async_send(void *arg)
+{
+    async_ws_send_arg_t *a = (async_ws_send_arg_t *)arg;
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.payload = a->data;
+    ws_pkt.len     = a->len;
+    ws_pkt.type    = HTTPD_WS_TYPE_TEXT;
+    httpd_ws_send_frame_async(a->hd, a->fd, &ws_pkt);
+    free(a->data);
+    free(a);
+}
+
+static esp_err_t log_ws_queue_send(httpd_handle_t server, int fd,
+                                    const uint8_t *data, size_t len)
+{
+    async_ws_send_arg_t *arg = calloc(1, sizeof(*arg));
+    if (!arg) return ESP_ERR_NO_MEM;
+    arg->data = malloc(len);
+    if (!arg->data) { free(arg); return ESP_ERR_NO_MEM; }
+    memcpy(arg->data, data, len);
+    arg->len = len;
+    arg->hd  = server;
+    arg->fd  = fd;
+    esp_err_t r = httpd_queue_work(server, log_ws_async_send, arg);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "log_ws: queue_work failed: %s", esp_err_to_name(r));
+        free(arg->data);
+        free(arg);
+    }
+    return r;
+}
+
+/** Push bytes into the ring buffer and queue a WS send if connected. */
+void web_log_push(const uint8_t *data, size_t len)
+{
+    // Store in ring buffer (full -> drop oldest)
+    for (size_t i = 0; i < len; i++) {
+        size_t next = (s_log_ring_head + 1) % LOG_RING_BUF_SIZE;
+        if (next == s_log_ring_tail) break;
+        s_log_ring[s_log_ring_head] = data[i];
+        s_log_ring_head = next;
+    }
+    // If a WS client is connected, queue a live send
+    if (g_log_ws_ctx.connected) {
+        log_ws_queue_send(g_log_ws_ctx.server, g_log_ws_ctx.fd, data, len);
+    }
+}
+
+static esp_err_t log_ws_handler(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+
+    // Detect new connection: fd changed or first time
+    if (fd != g_log_ws_ctx.fd) {
+        // New client — update context
+        g_log_ws_ctx.server = req->handle;
+        g_log_ws_ctx.fd     = fd;
+        g_log_ws_ctx.connected = true;
+
+        // Drain ring buffer — send recent history
+        uint8_t buf[LOG_RING_BUF_SIZE];
+        size_t i = s_log_ring_tail, count = 0;
+        while (i != s_log_ring_head) {
+            buf[count++] = s_log_ring[i];
+            i = (i + 1) % LOG_RING_BUF_SIZE;
+        }
+        if (count > 0)
+            log_ws_queue_send(g_log_ws_ctx.server, g_log_ws_ctx.fd, buf, count);
+
+        // Send a test message to verify the WS send path works
+        const char *test = "[log_ws] connected, streaming debug log...\n";
+        log_ws_queue_send(g_log_ws_ctx.server, g_log_ws_ctx.fd, (const uint8_t *)test, strlen(test));
+
+        ESP_LOGI(TAG, "log_ws: connected fd=%d", fd);
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        // Only clear context if this is still our connection (fd matches)
+        if (fd == g_log_ws_ctx.fd) {
+            g_log_ws_ctx.connected = false;
+            g_log_ws_ctx.server = NULL;
+            g_log_ws_ctx.fd     = -1;
+        }
+        return ret;
+    }
+    return ESP_OK;
+}
+
+/** HTML page for /log — live debug console */
+
+static esp_err_t log_page_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, LOG_PAGE, strlen(LOG_PAGE));
+}
 
 /* Event group for signaling cert changes to the barrier client */
 static EventGroupHandle_t s_event_group = NULL;
@@ -33,104 +163,6 @@ void web_server_set_event_group(EventGroupHandle_t events)
 /* ------------------------------------------------------------------
  * Embedded HTML page
  * ------------------------------------------------------------------ */
-static const char SETTINGS_PAGE[] =
-"<!DOCTYPE html><html><head>"
-"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>deskflow settings</title>"
-"<style>"
-"body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px}"
-"form{max-width:400px;margin:0 auto}"
-"label{display:block;margin-top:12px;font-size:13px;color:#aaa}"
-"input,select{width:100%;padding:8px;margin-top:4px;border:none;border-radius:4px;"
-"background:#222;color:#eee;font-size:14px;box-sizing:border-box}"
-"button{margin-top:24px;width:100%;padding:12px;border:none;border-radius:6px;"
-"background:#0a6;font-size:16px;cursor:pointer}"
-"button:hover{background:#0b7}"
-"button.danger{background:#a33;margin-top:12px}"
-"button.danger:hover{background:#c44}"
-"h1{font-size:20px;text-align:center;margin-bottom:8px}"
-".row{display:flex;gap:8px}"
-".row input{width:50%}"
-"</style></head><body>"
-"<h1>deskflow client</h1>"
-"<form id='f'>"
-"<label>Server</label>"
-"<input id='server' name='server' required>"
-"<label>Port</label>"
-"<input id='port' type='number' name='port' required>"
-"<label>Device name</label>"
-"<input id='device_name' name='device_name'>"
-"<label>Screen resolution</label>"
-"<div class='row'>"
-"<input id='width' type='number' name='screen_width'>"
-"<input id='height' type='number' name='screen_height'>"
-"</div>"
-"<label>Display scaling</label>"
-"<select id='scaling' name='scaling'>"
-"<option value='100'>100%</option>"
-"<option value='125'>125%</option>"
-"<option value='150'>150%</option>"
-"<option value='200'>200%</option>"
-"</select>"
-"<label>Jiggle interval (s)</label>"
-"<input id='jiggle' type='number' name='jiggle_interval' min='0'>"
-"<label><input type='checkbox' id='keep_awake' name='keep_awake' style='width:auto'>"
-" Keep display awake</label>"
-"<label>Keyboard layout</label>"
-"<select id='keyboard_layout' name='keyboard_layout'>"
-"<option value='0'>US</option>"
-"<option value='1'>German (DE)</option>"
-"</select>"
-"<label>VLAN ID (-1 = disabled)</label>"
-"<input id='vlan_id' type='number' name='vlan_id' min='-1' max='4094'>"
-"<button type='submit'>Save</button>"
-"<button type='button' class='danger' onclick='reboot()'>Reboot</button>"
-"</form>"
-"<script>"
-"const load=()=>fetch('/api/settings').then(r=>r.json()).then(d=>{"
-"document.getElementById('server').value=d.server||'';"
-"document.getElementById('port').value=d.port||24800;"
-"document.getElementById('device_name').value=d.device_name||'';"
-"document.getElementById('width').value=d.screen_width||1920;"
-"document.getElementById('height').value=d.screen_height||1080;"
-"document.getElementById('scaling').value=d.scaling||100;"
-"document.getElementById('jiggle').value=d.jiggle_interval||30;"
-"document.getElementById('keep_awake').checked=!!d.keep_awake;"
-"document.getElementById('keyboard_layout').value=d.keyboard_layout||0;"
-"document.getElementById('vlan_id').value=d.vlan_id ?? -1;"
-"});"
-"load();"
-"document.getElementById('f').onsubmit=async e=>{"
-"e.preventDefault();"
-"const d={};new FormData(e.target).forEach((v,k)=>d[k]=v);"
-"if(d.keep_awake===undefined) d.keep_awake=0; else d.keep_awake=1;"
-"d.port=+d.port;d.screen_width=+d.screen_width;d.screen_height=+d.screen_height;"
-"d.scaling=+d.scaling;d.jiggle_interval=+d.jiggle_interval;d.keyboard_layout=+d.keyboard_layout;"
-"d.vlan_id=+d.vlan_id;"
-"fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
-"body:JSON.stringify(d)});load();"
-"};"
-"function reboot(){if(confirm('Reboot now?'))fetch('/api/reboot');}"
-"</script>"
-"<hr><label>Certificates (PEM)</label>"
-"<label style='font-size:11px'>CA</label>"
-"<textarea id='ca' style='width:100%;height:60px;background:#1a1a1a;color:#ccc;border:1px solid #333;padding:4px;font-size:11px'></textarea>"
-"<label style='font-size:11px'>Client cert</label>"
-"<textarea id='cert' style='width:100%;height:60px;background:#1a1a1a;color:#ccc;border:1px solid #333;padding:4px;font-size:11px'></textarea>"
-"<label style='font-size:11px'>Client key</label>"
-"<textarea id='key' style='width:100%;height:60px;background:#1a1a1a;color:#ccc;border:1px solid #333;padding:4px;font-size:11px'></textarea>"
-"<button type='button' onclick='uploadCerts()'>Upload certs</button>"
-"<script>"
-"function uploadCerts(){"
-"fetch('/api/cert',{method:'POST',headers:{'Content-Type':'application/json'}"
-",body:JSON.stringify({"
-"ca:document.getElementById('ca').value,"
-"cert:document.getElementById('cert').value,"
-"key:document.getElementById('key').value"
-"})}).then(r=>{if(r.ok)alert('Certs uploaded. Reconnecting...');else alert('Upload failed');});"
-"}"
-"</script></body></html>";
-
 /* ------------------------------------------------------------------
  * GET /  -> settings page
  * ------------------------------------------------------------------ */
@@ -444,13 +476,6 @@ typedef struct {
 
 static uart_ws_ctx_t g_ws_ctx = {0};
 
-typedef struct {
-    httpd_handle_t hd;
-    int            fd;
-    uint8_t       *data;
-    size_t         len;
-} async_ws_send_arg_t;
-
 /**
  * Async send callback: executed on the HTTPD thread via httpd_queue_work.
  * Sends a WebSocket frame using httpd_ws_send_frame_async.
@@ -488,7 +513,12 @@ static esp_err_t uart_ws_queue_send(httpd_handle_t server, int fd,
     arg->hd  = server;
     arg->fd  = fd;
 
-    return httpd_queue_work(server, uart_ws_async_send, arg);
+    esp_err_t r = httpd_queue_work(server, uart_ws_async_send, arg);
+    if (r != ESP_OK) {
+        free(arg->data);
+        free(arg);
+    }
+    return r;
 }
 
 /**
@@ -535,11 +565,13 @@ static void uart_ws_cleanup(void)
  */
 static esp_err_t uart_ws_handler(httpd_req_t *req)
 {
-    /* First call: initialize context and start sender task */
-    if (!g_ws_ctx.running) {
+    int fd = httpd_req_to_sockfd(req);
+
+    /* Detect new connection: fd changed or first time */
+    if (fd != g_ws_ctx.fd) {
         uart_ws_cleanup(); /* safety: clear stale state */
         g_ws_ctx.server = req->handle;
-        g_ws_ctx.fd     = httpd_req_to_sockfd(req);
+        g_ws_ctx.fd     = fd;
         g_ws_ctx.running = true;
 
         if (xTaskCreate(uart_ws_sender_task, "uart_ws_s", 4096, &g_ws_ctx, 5,
@@ -548,7 +580,7 @@ static esp_err_t uart_ws_handler(httpd_req_t *req)
             g_ws_ctx.running = false;
             return ESP_ERR_NO_MEM;
         }
-        ESP_LOGI(TAG, "ws: connection established fd=%d", g_ws_ctx.fd);
+        ESP_LOGI(TAG, "ws: connection established fd=%d", fd);
     }
 
     /* Two-step receive (ESP-IDF ws_echo_server pattern) */
@@ -560,7 +592,8 @@ static esp_err_t uart_ws_handler(httpd_req_t *req)
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ws: recv_frame(len) failed: %d, disconnecting", ret);
-        uart_ws_cleanup();
+        // Only clear if this is still our connection
+        if (fd == g_ws_ctx.fd) uart_ws_cleanup();
         return ret;
     }
 
@@ -603,7 +636,7 @@ esp_err_t web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.ctrl_port = 32768;
-    config.max_uri_handlers = 9;
+    config.max_uri_handlers = 11;
     config.stack_size = 8192;
 
     esp_err_t ret = httpd_start(&server, &config);
@@ -635,7 +668,14 @@ esp_err_t web_server_start(void)
     httpd_uri_t uart_ws = { .uri = "/api/uart/ws",   .method = HTTP_GET,  .handler = uart_ws_handler, .user_ctx = NULL };
     uart_ws.is_websocket = true;
     httpd_register_uri_handler(server, &uart_ws);
+
+    httpd_uri_t log_ws = { .uri = "/api/log/ws",     .method = HTTP_GET,  .handler = log_ws_handler, .user_ctx = NULL };
+    log_ws.is_websocket = true;
+    httpd_register_uri_handler(server, &log_ws);
 #endif
+
+    httpd_uri_t log_p = { .uri = "/log",             .method = HTTP_GET,  .handler = log_page_handler };
+    httpd_register_uri_handler(server, &log_p);
 
     ESP_LOGI(TAG, "Web server started on port 80");
     return ESP_OK;
