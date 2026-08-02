@@ -1,0 +1,50 @@
+/*
+ * Debug log HTML page
+ * Served at /log
+ */
+#ifndef LOG_PAGE_H
+#define LOG_PAGE_H
+
+static const char LOG_PAGE[] =
+"<!DOCTYPE html><html><head>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>deskflow log</title>"
+"<style>"
+"*{box-sizing:border-box;margin:0;padding:0}"
+"body{font-family:'Courier New',monospace;background:#0a0a0a;color:#0f0;height:100vh;display:flex;flex-direction:column}"
+"#hdr{padding:8px 12px;background:#111;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center}"
+"#hdr h1{font-size:14px;color:#0f0}"
+"#status{font-size:11px}"
+"#log{flex:1;overflow-y:auto;padding:8px;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.4;min-height:200px}"
+"#log::-webkit-scrollbar{width:6px}"
+"#log::-webkit-scrollbar-thumb{background:#333;border-radius:3px}"
+".E{color:#f44}.W{color:#fa0}.I{color:#4f4}.D{color:#888}.V{color:#666}"
+"</style></head><body>"
+"<div id='hdr'><h1>deskflow debug log</h1><span id='status'>disconnected</span></div>"
+"<div id='log'></div>"
+"<script>"
+"var ws,el=document.getElementById('log'),st=document.getElementById('status');"
+"function connect(){"
+"  var p=location.protocol==='https:'?'wss://':'ws://';"
+"  ws=new WebSocket(p+location.host+'/api/log/ws');"
+"  ws.onopen=function(){st.textContent='connected';st.style.color='#0f0';ws.send('')};"
+"  ws.onclose=function(){st.textContent='disconnected';st.style.color='#f44';setTimeout(connect,2000)};"
+"  ws.onmessage=function(ev){"
+"    var line=ev.data;"
+"    var cls='I';"
+"    if(/\\\\(E\\\\)/.test(line))cls='E';"
+"    else if(/\\\\(W\\\\)/.test(line))cls='W';"
+"    else if(/\\\\(D\\\\)/.test(line))cls='D';"
+"    else if(/\\\\(V\\\\)/.test(line))cls='V';"
+"    var d=document.createElement('div');"
+"    d.className=cls;"
+"    d.textContent=line;"
+"    el.appendChild(d);"
+"    el.scrollTop=el.scrollHeight;"
+"    if(el.childNodes.length>2000)el.removeChild(el.firstChild);"
+"  };"
+"}"
+"connect();"
+"</script></body></html>";
+
+#endif
