@@ -101,6 +101,8 @@ void app_main(void)
     } else if (eth_start(&s_eth_state) != ESP_OK) {
         ESP_LOGE(TAG, "Ethernet start failed");
     } else {
+        /* Apply VLAN from config (hot register writes, no restart) */
+        eth_set_vlan(cfg->vlan_id);
         ESP_LOGI(TAG, "Ethernet started, waiting for IP...");
     }
 
