@@ -41,3 +41,11 @@ idf_component_register(
         "web"
         "grove"
 )
+idf_component_get_property(lwip lwip COMPONENT_LIB)
+target_compile_options(${lwip} PRIVATE "-I${CMAKE_CURRENT_SOURCE_DIR}/network")
+target_compile_definitions(${lwip} PRIVATE
+    "-DESP_IDF_LWIP_HOOK_FILENAME=\"vlan_hooks.h\""
+    "-DETHARP_SUPPORT_VLAN=1"
+    "-DLWIP_HOOK_VLAN_CHECK=lwip_vlan_check"
+    "-DLWIP_HOOK_VLAN_SET=lwip_vlan_set"
+)
