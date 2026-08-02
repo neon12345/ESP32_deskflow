@@ -7,6 +7,7 @@
  * Barrier protocol packet dispatch, and actuator calls.
  */
 #include "esp_log.h"
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -25,6 +26,28 @@
 static const char *TAG = "deskflow_main";
 #define MAIN_MONITOR_INTERVAL_MS  2000
 
+/** Redirect ESP_LOG output to the web WebSocket log buffer. */
+static int (*s_orig_vprintf)(const char *, va_list);
+
+static int esp_log_ws_redirect(const char *fmt, va_list args)
+{
+    va_list copy;
+    va_copy(copy, args);
+
+    int r = 0;
+    if (s_orig_vprintf)
+        r = s_orig_vprintf(fmt, args);
+
+    if (web_log_ws_connected()) {
+        char buf[256];
+        int len = vsnprintf(buf, sizeof(buf), fmt, copy);
+        if (len > 0)
+            web_log_push((const uint8_t *)buf, (size_t)len);
+    }
+    va_end(copy);
+    return r;
+}
+
 /* Event group for tracking network state */
 static EventGroupHandle_t s_network_events;
 
@@ -34,6 +57,10 @@ static eth_state_t s_eth_state;
 void app_main(void)
 {
     esp_err_t ret;
+
+    /* Route ESP_LOG to the web debug-log WebSocket (/api/log/ws)
+     * — falls through to UART when no WS client is connected. */
+    s_orig_vprintf = esp_log_set_vprintf(esp_log_ws_redirect);
 
     ESP_LOGI(TAG, "deskflow client starting");
 
