@@ -50,54 +50,58 @@ static uint8_t s_log_ring[LOG_RING_BUF_SIZE];
 static volatile size_t s_log_ring_head = 0;
 static volatile size_t s_log_ring_tail = 0;
 
-/** Async send callback for log WebSocket frames. */
-static void log_ws_async_send(void *arg)
+/** Drain ring buffer and send over WebSocket. Zero malloc. */
+void web_log_drain(void)
 {
-    async_ws_send_arg_t *a = (async_ws_send_arg_t *)arg;
+    volatile size_t tail = s_log_ring_tail;
+    volatile size_t head = s_log_ring_head;
+
+    if (tail == head) return;
+
+    size_t count = (head >= tail) ? (head - tail) : (LOG_RING_BUF_SIZE - tail + head);
+
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(ws_pkt));
-    ws_pkt.payload = a->data;
-    ws_pkt.len     = a->len;
-    ws_pkt.type    = HTTPD_WS_TYPE_TEXT;
-    httpd_ws_send_frame_async(a->hd, a->fd, &ws_pkt);
-    free(a->data);
-    free(a);
-}
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
-static esp_err_t log_ws_queue_send(httpd_handle_t server, int fd,
-                                    const uint8_t *data, size_t len)
-{
-    async_ws_send_arg_t *arg = calloc(1, sizeof(*arg));
-    if (!arg) return ESP_ERR_NO_MEM;
-    arg->data = malloc(len);
-    if (!arg->data) { free(arg); return ESP_ERR_NO_MEM; }
-    memcpy(arg->data, data, len);
-    arg->len = len;
-    arg->hd  = server;
-    arg->fd  = fd;
-    esp_err_t r = httpd_queue_work(server, log_ws_async_send, arg);
-    if (r != ESP_OK) {
-        ESP_LOGE(TAG, "log_ws: queue_work failed: %s", esp_err_to_name(r));
-        free(arg->data);
-        free(arg);
+    esp_err_t r = ESP_FAIL;
+    if (head >= tail) {
+        ws_pkt.payload = &s_log_ring[tail];
+        ws_pkt.len = count;
+        r = httpd_ws_send_frame_async(g_log_ws_ctx.server, g_log_ws_ctx.fd, &ws_pkt);
+    } else {
+        size_t first = LOG_RING_BUF_SIZE - tail;
+        ws_pkt.payload = &s_log_ring[tail];
+        ws_pkt.len = first;
+        r = httpd_ws_send_frame_async(g_log_ws_ctx.server, g_log_ws_ctx.fd, &ws_pkt);
+
+        if (r == ESP_OK) {
+            ws_pkt.payload = s_log_ring;
+            ws_pkt.len = head;
+            r = httpd_ws_send_frame_async(g_log_ws_ctx.server, g_log_ws_ctx.fd, &ws_pkt);
+        }
     }
-    return r;
+
+    /* Only advance tail if send succeeded */
+    if (r == ESP_OK)
+        s_log_ring_tail = head;
 }
 
-/** Push bytes into the ring buffer and queue a WS send if connected. */
 void web_log_push(const uint8_t *data, size_t len)
 {
-    // Store in ring buffer (full -> drop oldest)
+    if (!g_log_ws_ctx.connected) return;
     for (size_t i = 0; i < len; i++) {
         size_t next = (s_log_ring_head + 1) % LOG_RING_BUF_SIZE;
         if (next == s_log_ring_tail) break;
         s_log_ring[s_log_ring_head] = data[i];
         s_log_ring_head = next;
     }
-    // If a WS client is connected, queue a live send
-    if (g_log_ws_ctx.connected) {
-        log_ws_queue_send(g_log_ws_ctx.server, g_log_ws_ctx.fd, data, len);
-    }
+    /* Proactively drain at 60% to avoid losing data under high volume */
+    size_t used = (s_log_ring_head >= s_log_ring_tail)
+                 ? (s_log_ring_head - s_log_ring_tail)
+                 : (LOG_RING_BUF_SIZE - s_log_ring_tail + s_log_ring_head);
+    if (used > (LOG_RING_BUF_SIZE * 3) / 5)
+        web_log_drain();
 }
 
 static esp_err_t log_ws_handler(httpd_req_t *req)
@@ -111,19 +115,12 @@ static esp_err_t log_ws_handler(httpd_req_t *req)
         g_log_ws_ctx.fd     = fd;
         g_log_ws_ctx.connected = true;
 
-        // Drain ring buffer — send recent history
-        uint8_t buf[LOG_RING_BUF_SIZE];
-        size_t i = s_log_ring_tail, count = 0;
-        while (i != s_log_ring_head) {
-            buf[count++] = s_log_ring[i];
-            i = (i + 1) % LOG_RING_BUF_SIZE;
-        }
-        if (count > 0)
-            log_ws_queue_send(g_log_ws_ctx.server, g_log_ws_ctx.fd, buf, count);
+        // Discard stale ring data — no WS was listening before.
+        s_log_ring_tail = s_log_ring_head;
 
         // Send a test message to verify the WS send path works
         const char *test = "[log_ws] connected, streaming debug log...\n";
-        log_ws_queue_send(g_log_ws_ctx.server, g_log_ws_ctx.fd, (const uint8_t *)test, strlen(test));
+        web_log_push((const uint8_t *)test, strlen(test));
 
         ESP_LOGI(TAG, "log_ws: connected fd=%d", fd);
     }
@@ -149,6 +146,30 @@ static esp_err_t log_page_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, LOG_PAGE, strlen(LOG_PAGE));
+}
+
+static bool g_log_debug = false;
+
+static esp_err_t log_level_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        const char *lvl = g_log_debug ? "1" : "0";
+        return httpd_resp_sendstr(req, lvl);
+    }
+    char buf[4];
+    int rlen = httpd_req_recv(req, buf, sizeof(buf));
+    if (rlen >= 3 && buf[2] == '1') {
+        esp_log_level_set("hid_task", ESP_LOG_DEBUG);
+        esp_log_level_set("keycodes", ESP_LOG_DEBUG);
+        esp_log_level_set("tusb_device", ESP_LOG_DEBUG);
+        g_log_debug = true;
+    } else {
+        esp_log_level_set("hid_task", ESP_LOG_INFO);
+        esp_log_level_set("keycodes", ESP_LOG_INFO);
+        esp_log_level_set("tusb_device", ESP_LOG_INFO);
+        g_log_debug = false;
+    }
+    return httpd_resp_send(req, NULL, 0);
 }
 
 /* Event group for signaling cert changes to the barrier client */
@@ -636,7 +657,7 @@ esp_err_t web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.ctrl_port = 32768;
-    config.max_uri_handlers = 11;
+    config.max_uri_handlers = 13;
     config.stack_size = 8192;
 
     esp_err_t ret = httpd_start(&server, &config);
@@ -676,6 +697,12 @@ esp_err_t web_server_start(void)
 
     httpd_uri_t log_p = { .uri = "/log",             .method = HTTP_GET,  .handler = log_page_handler };
     httpd_register_uri_handler(server, &log_p);
+
+    httpd_uri_t log_lv = { .uri = "/api/log/level", .method = HTTP_POST, .handler = log_level_handler };
+    httpd_register_uri_handler(server, &log_lv);
+
+    httpd_uri_t log_lv_get = { .uri = "/api/log/level", .method = HTTP_GET, .handler = log_level_handler };
+    httpd_register_uri_handler(server, &log_lv_get);
 
     ESP_LOGI(TAG, "Web server started on port 80");
     return ESP_OK;
