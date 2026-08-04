@@ -45,12 +45,7 @@ static inline uint16_t clamp_u16(int32_t v, uint16_t max)
     return (uint16_t)v;
 }
 
-static int8_t clamp_int8(int16_t val)
-{
-    if (val > INT8_MAX) return INT8_MAX;
-    if (val < INT8_MIN) return INT8_MIN;
-    return (int8_t)val;
-}
+
 
 /* ------------------------------------------------------------------ */
 /* HID report sending                                                  */
@@ -458,7 +453,11 @@ static void hid_task(void *arg)
             }
 
             case ACT_CMD_MOUSE_WHEEL: {
-                act->mouse_wheel = clamp_int8(cmd.d.wheel.dy);
+                /* Dampen scroll to avoid jumping */
+                int16_t dy = cmd.d.wheel.dy;
+                if (dy > 3) dy = 3;
+                else if (dy < -3) dy = -3;
+                act->mouse_wheel = (int8_t)dy;
                 send_abs_mouse_retry(act);
                 break;
             }
