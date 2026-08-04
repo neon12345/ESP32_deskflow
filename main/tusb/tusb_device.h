@@ -17,6 +17,8 @@
 esp_err_t tusb_device_init(void);
 bool      tusb_device_is_mounted(void);
 bool      tusb_device_is_suspended(void);
+bool      tusb_try_remote_wakeup(void);
+void      tusb_set_pending_send(bool pending);
 
 /* Set HID task handle so tud_hid_report_complete_cb can wake it */
 void      tusb_set_hid_task_handle(void *handle);
