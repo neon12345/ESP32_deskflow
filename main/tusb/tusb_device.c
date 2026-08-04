@@ -24,6 +24,19 @@ static const char *TAG = "tusb_device";
 #define TUSB_HID_POLL_MS     10
 
 static bool g_suspended = false;
+static bool g_remote_wakeup_en = false;
+static volatile bool g_pending_send = false;
+
+void tusb_set_pending_send(bool pending)
+{
+    g_pending_send = pending;
+}
+
+bool tusb_try_remote_wakeup(void)
+{
+    if (!g_suspended || !g_remote_wakeup_en || !g_pending_send) return false;
+    return tud_remote_wakeup();
+}
 
 /* HID task handle - set by actuator, used by tud_hid_report_complete_cb to wake it */
 static TaskHandle_t g_hid_task_handle = NULL;
@@ -119,8 +132,11 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 void tud_suspend_cb(bool remote_wakeup_en)
 {
     g_suspended = true;
-    (void) remote_wakeup_en;
-    ESP_LOGI(TAG, "Device suspended");
+    g_remote_wakeup_en = remote_wakeup_en;
+    if (g_pending_send && g_remote_wakeup_en) {
+        tud_remote_wakeup();
+    }
+    ESP_LOGI(TAG, "Device suspended, remote_wakeup=%s", remote_wakeup_en ? "yes" : "no");
 }
 
 void tud_resume_cb(void)
