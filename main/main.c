@@ -7,6 +7,7 @@
  * Barrier protocol packet dispatch, and actuator calls.
  */
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,7 +36,7 @@ static int esp_log_ws_redirect(const char *fmt, va_list args)
     va_copy(copy, args);
 
     int r = 0;
-    if (s_orig_vprintf)
+    if (s_orig_vprintf && gpio_get_level(8))
         r = s_orig_vprintf(fmt, args);
 
     if (web_log_ws_connected()) {
@@ -63,6 +64,18 @@ void app_main(void)
     s_orig_vprintf = esp_log_set_vprintf(esp_log_ws_redirect);
 
     ESP_LOGI(TAG, "deskflow client starting");
+
+    /* --------------------------------------------------------
+     * 0. Initialize GPIO8 as input
+     * -------------------------------------------------------- */
+    gpio_config_t gpio8_conf = {
+        .pin_bit_mask = (1ULL << 8),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&gpio8_conf);
 
     /* --------------------------------------------------------
      * 1. Initialize and start USB host MSC (runs permanently)
@@ -214,6 +227,11 @@ void app_main(void)
 
         /* Update status LED */
         led_rgb_state(has_ip, tusb_device_is_mounted() || usb_host_msc_is_mounted());
+
+        /* Drain any accumulated WebSocket log data */
+        if (web_log_ws_connected()) {
+            web_log_drain();
+        }
 
         /* Always yield — wait bits returns instantly when bit is already set */
         vTaskDelay(pdMS_TO_TICKS(100));
