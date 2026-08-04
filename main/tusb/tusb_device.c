@@ -23,8 +23,8 @@ static const char *TAG = "tusb_device";
 #define TUSB_HID_EP_SIZE     16
 #define TUSB_HID_POLL_MS     10
 
-static bool g_suspended = false;
-static bool g_remote_wakeup_en = false;
+static bool g_suspended = true;  // assume suspended until host tells us otherwise
+static bool g_remote_wakeup_en = true;
 static volatile bool g_pending_send = false;
 
 void tusb_set_pending_send(bool pending)
