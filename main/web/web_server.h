@@ -21,6 +21,9 @@ void      web_server_set_event_group(EventGroupHandle_t events);
 /* Push bytes into the debug-log ring buffer (drained over /api/log/ws) */
 void      web_log_push(const uint8_t *data, size_t len);
 
+/* Drain ring buffer and send over WebSocket (zero malloc, no buffer needed) */
+void      web_log_drain(void);
+
 /* Returns true if a log WebSocket client is connected */
 bool      web_log_ws_connected(void);
 
