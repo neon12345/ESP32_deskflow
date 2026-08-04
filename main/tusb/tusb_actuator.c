@@ -61,10 +61,13 @@ static void send_kb_report(tusb_actuator_t *act, uint8_t *report)
 {
     uint32_t ul_notif;
 
+    tusb_set_pending_send(true);
+    (void)tusb_try_remote_wakeup();
+
     while (!tud_hid_report(DF_HID_KEYBOARD, report, KEYBOARD_REPORT_LEN)) {
-        /* Endpoint busy - sleep until tud_hid_report_complete_cb wakes us */
         (void)xTaskNotifyWait(0, 0, &ul_notif, portMAX_DELAY);
     }
+    tusb_set_pending_send(false);
 }
 
 /* Send absolute mouse report - block until accepted via callback wake */
@@ -83,15 +86,21 @@ static void send_abs_mouse_retry(tusb_actuator_t *act)
     };
 
     uint32_t ul_notif;
+    tusb_set_pending_send(true);
+    (void)tusb_try_remote_wakeup();
     do {
         if (tud_hid_report(DF_HID_ABS_MOUSE, report, ABS_MOUSE_REPORT_LEN)) {
             act->last_sent_hx      = hx;
             act->last_sent_hy      = hy;
             act->last_sent_buttons = act->mouse_buttons;
             act->mouse_wheel       = 0;
+            tusb_set_pending_send(false);
             return;
         }
-        if (!important) return;
+        if (!important) {
+            tusb_set_pending_send(false);
+            return;
+        }
         (void)xTaskNotifyWait(0, 0, &ul_notif, portMAX_DELAY);
     } while (true);
 }
